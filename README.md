@@ -47,4 +47,6 @@ make stats      # Получение статистики сервиса (curl h
 
 [Подробный результат теста](./loadtest/README.md)
 
----
+## API Documentation
+
+[OpenAPI Specification](./openapi.yml)
