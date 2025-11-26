@@ -337,8 +337,50 @@ func (h *Handler) GetStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
+// DeactivateTeamUsersRequest представляет запрос на массовую деактивацию.
+type DeactivateTeamUsersRequest struct {
+	TeamName string   `json:"team_name"`
+	UserIDs  []string `json:"user_ids"`
+}
+
+// DeactivateTeamUsers деактивирует нескольких пользователей одной команды.
+func (h *Handler) DeactivateTeamUsers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, "METHOD_NOT_ALLOWED", "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req DeactivateTeamUsersRequest
+	if err := bindJSON(r, &req); err != nil {
+		writeError(w, "INVALID_REQUEST", "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.TeamName == "" {
+		writeError(w, "INVALID_REQUEST", "team_name is required", http.StatusBadRequest)
+		return
+	}
+
+	users, err := h.store.DeactivateTeamUsers(r.Context(), req.TeamName, req.UserIDs)
+	if err != nil {
+		switch err {
+		case store.ErrNotFound:
+			writeError(w, "NOT_FOUND", "team or user not found", http.StatusNotFound)
+		default:
+			writeError(w, "INTERNAL_ERROR", err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"team_name": req.TeamName,
+		"updated":   users,
+	})
+}
+
 // SetupRoutes настраивает маршруты
 func (h *Handler) SetupRoutes(mux *http.ServeMux) {
+	// Health
 	mux.HandleFunc("GET /health", h.Health)
 
 	// Teams
@@ -348,6 +390,7 @@ func (h *Handler) SetupRoutes(mux *http.ServeMux) {
 	// Users
 	mux.HandleFunc("POST /users/setIsActive", h.SetUserActive)
 	mux.HandleFunc("GET /users/getReview", h.GetUserReviews)
+	mux.HandleFunc("POST /users/deactivateTeamUsers", h.DeactivateTeamUsers)
 
 	// PullRequests
 	mux.HandleFunc("POST /pullRequest/create", h.CreatePR)

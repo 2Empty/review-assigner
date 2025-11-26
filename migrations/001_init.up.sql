@@ -19,3 +19,4 @@ CREATE INDEX idx_users_team_name ON users(team_name);
 CREATE INDEX idx_users_active ON users(is_active) WHERE is_active = true;
 CREATE INDEX idx_prs_author ON pull_requests(author_id);
 CREATE INDEX idx_prs_status ON pull_requests(status);
+CREATE INDEX idx_prs_reviewers_gin ON pull_requests USING gin(assigned_reviewers);

@@ -3,10 +3,12 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand/v2"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/2Empty/review-assigner/internal/models"
@@ -130,36 +132,61 @@ func (s *Store) GetTeam(ctx context.Context, teamName string) (*models.Team, err
 }
 
 // lockTeamByUserID блокирует команду пользователя через advisory lock и возвращает имя команды.
-// Возвращает функцию для разблокировки, которую нужно вызвать через defer.
-func (s *Store) lockTeamByUserID(ctx context.Context, userID string) (string, func(), error) {
+func (s *Store) lockTeamByUserID(ctx context.Context, tx pgx.Tx, userID string) (string, error) {
 	var teamName string
-	err := s.Pool.QueryRow(ctx, `SELECT team_name FROM users WHERE user_id = $1`, userID).Scan(&teamName)
+	err := tx.QueryRow(ctx, `SELECT team_name FROM users WHERE user_id = $1`, userID).Scan(&teamName)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return "", nil, ErrNotFound
+			return "", ErrNotFound
 		}
-		return "", nil, fmt.Errorf("get user team: %w", err)
+		return "", fmt.Errorf("get user team: %w", err)
 	}
 
-	_, err = s.Pool.Exec(ctx, "SELECT pg_advisory_lock(hashtext($1))", teamName)
+	_, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", teamName)
 	if err != nil {
-		return "", nil, fmt.Errorf("lock team: %w", err)
+		return "", fmt.Errorf("lock team: %w", err)
 	}
 
-	unlock := func() {
-		_, _ = s.Pool.Exec(ctx, "SELECT pg_advisory_unlock(hashtext($1))", teamName)
+	return teamName, nil
+}
+
+func (s *Store) lockTeamByName(ctx context.Context, tx pgx.Tx, teamName string) error {
+	if teamName == "" {
+		return fmt.Errorf("lock team: team name is required")
 	}
 
-	return teamName, unlock, nil
+	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", teamName)
+	if err != nil {
+		return fmt.Errorf("lock team: %w", err)
+	}
+
+	return nil
 }
 
 // SetUserActive изменяет флаг активности пользователя.
 // При деактивации автоматически переназначает ревьюеров для открытых PR.
 func (s *Store) SetUserActive(ctx context.Context, userID string, isActive bool) (*models.User, error) {
+	// Блокируем команду для предотвращения гонок данных
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil && err != pgx.ErrTxClosed {
+			log.Printf("Failed to rollback transaction: %v", err)
+		}
+	}()
+	_, err = s.lockTeamByUserID(ctx, tx, userID)
+	if err != nil {
+		if err == ErrNotFound {
+			return nil, fmt.Errorf("set user active: %w", ErrNotFound)
+		}
+		return nil, err
+	}
 	// Если активируем пользователя, просто обновляем флаг
 	if isActive {
 		var user models.User
-		err := s.Pool.QueryRow(ctx, `
+		err := tx.QueryRow(ctx, `
 			UPDATE users
 			SET is_active = $1
 			WHERE user_id = $2
@@ -172,64 +199,28 @@ func (s *Store) SetUserActive(ctx context.Context, userID string, isActive bool)
 			}
 			return nil, fmt.Errorf("set user active: %w", err)
 		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("commit tx: %w", err)
+		}
 		return &user, nil
 	}
 
-	// Для деактивации: переназначаем ревьюеров, потом деактивируем
-	// Блокируем команду для предотвращения гонок данных
-	_, unlock, err := s.lockTeamByUserID(ctx, userID)
+	user, err := deactivateUserInTx(ctx, tx, userID)
 	if err != nil {
-		if err == ErrNotFound {
-			return nil, fmt.Errorf("set user active: %w", ErrNotFound)
-		}
-		return nil, err
-	}
-	defer unlock()
-
-	// Пытаемся переназначить ревьюеров для открытых PR
-	prs, err := s.GetUserReviews(ctx, userID)
-	if err != nil {
-		// Если не удалось получить список, всё равно деактивируем пользователя
-		log.Printf("Failed to get user reviews for reassignment: %v", err)
-	} else {
-		// Переназначаем ревьюеров для открытых PR
-		for _, pr := range prs {
-			if pr.Status == "OPEN" {
-				_, _, err := s.ReassignReviewer(ctx, pr.PullRequestID, userID)
-				if err != nil {
-					// Логируем, но продолжаем - не критично если не удалось переназначить
-					log.Printf("Failed to reassign reviewer for PR %s: %v", pr.PullRequestID, err)
-				}
-			}
-		}
-	}
-
-	// Деактивируем пользователя
-	var user models.User
-	err = s.Pool.QueryRow(ctx, `
-		UPDATE users
-		SET is_active = false
-		WHERE user_id = $1
-		RETURNING user_id, username, team_name, is_active`,
-		userID).Scan(&user.UserID, &user.Username, &user.TeamName, &user.IsActive)
-
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, fmt.Errorf("set user active: %w", ErrNotFound)
-		}
 		return nil, fmt.Errorf("set user active: %w", err)
 	}
-	return &user, nil
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+	return user, nil
 }
 
-// CreatePR создает новый PR в базе данных.
-func (s *Store) CreatePR(ctx context.Context, prID, prName, authorID string) (*models.PullRequest, error) {
-	// Блокируем команду автора для предотвращения гонок данных
-	authorTeam, unlock, err := s.lockTeamByUserID(ctx, authorID)
-	if err != nil {
-		return nil, err
+// DeactivateTeamUsers выполняет массовую деактивацию участников команды.
+// Если список userIDs пуст, будут деактивированы все активные участники команды.
+func (s *Store) DeactivateTeamUsers(ctx context.Context, teamName string, userIDs []string) ([]models.User, error) {
+	if teamName == "" {
+		return nil, fmt.Errorf("deactivate team users: team name is required")
 	}
-	defer unlock()
 
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -240,6 +231,143 @@ func (s *Store) CreatePR(ctx context.Context, prID, prName, authorID string) (*m
 			log.Printf("Failed to rollback transaction: %v", err)
 		}
 	}()
+
+	err = s.lockTeamByName(ctx, tx, teamName)
+	if err != nil {
+		return nil, fmt.Errorf("deactivate team users: %w", err)
+	}
+
+	targetIDs, missing, err := s.selectTeamUserIDs(ctx, tx, teamName, userIDs)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrTeamNotFound):
+			return nil, fmt.Errorf("deactivate team users: %w", ErrTeamNotFound)
+		case errors.Is(err, ErrNotFound):
+			return nil, fmt.Errorf("deactivate team users: %w", ErrNotFound)
+		default:
+			return nil, fmt.Errorf("deactivate team users: %w", err)
+		}
+	}
+
+	var (
+		deactivated []models.User
+		errs        []error
+	)
+
+	for _, id := range targetIDs {
+		//user, err := s.deactivateUserNoLock(ctx, id)
+		user, err := deactivateUserInTx(ctx, tx, id)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("user %s: %w", id, err))
+			continue
+		}
+		deactivated = append(deactivated, *user)
+	}
+
+	if len(deactivated) == 0 {
+		if len(errs) > 0 {
+			return nil, errors.Join(errs...)
+		}
+		return nil, fmt.Errorf("deactivate team users: %w", ErrNotFound)
+	}
+	//Логируем, если есть пользователи, которые не найдены в команде
+	//Но с найденными пользователями продолжаем работу
+	if len(missing) > 0 {
+		log.Printf("users not found in team %s: %s", teamName, strings.Join(missing, ", "))
+	}
+
+	if len(errs) > 0 {
+		return deactivated, errors.Join(errs...)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+	return deactivated, nil
+}
+
+func (s *Store) selectTeamUserIDs(ctx context.Context, tx pgx.Tx, teamName string, requested []string) ([]string, []string, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT user_id, is_active
+		FROM users
+		WHERE team_name = $1`,
+		teamName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch team users: %w", err)
+	}
+	defer rows.Close()
+
+	userState := make(map[string]bool)
+
+	for rows.Next() {
+		var id string
+		var isActive bool
+		if err := rows.Scan(&id, &isActive); err != nil {
+			return nil, nil, fmt.Errorf("scan team user: %w", err)
+		}
+		userState[id] = isActive
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate team users: %w", err)
+	}
+
+	if len(userState) == 0 {
+		return nil, nil, fmt.Errorf("team %s not found: %w", teamName, ErrTeamNotFound)
+	}
+
+	if len(requested) == 0 {
+		var ids []string
+		for id, active := range userState {
+			if active {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) == 0 {
+			return nil, nil, fmt.Errorf("no active users in team %s: %w", teamName, ErrNotFound)
+		}
+		return ids, nil, nil
+	}
+
+	unique := uniqueStrings(requested)
+	if len(unique) == 0 {
+		return nil, nil, fmt.Errorf("no valid user ids provided: %w", ErrNotFound)
+	}
+
+	var ids []string
+	var missing []string
+	for _, id := range unique {
+		active, ok := userState[id]
+		if !ok {
+			missing = append(missing, id)
+			continue
+		}
+		if active {
+			ids = append(ids, id)
+		}
+	}
+
+	if len(ids) == 0 {
+		return nil, missing, fmt.Errorf("no active users matched selection: %w", ErrNotFound)
+	}
+
+	return ids, missing, nil
+}
+
+// CreatePR создает новый PR в базе данных.
+func (s *Store) CreatePR(ctx context.Context, prID, prName, authorID string) (*models.PullRequest, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil && err != pgx.ErrTxClosed {
+			log.Printf("Failed to rollback transaction: %v", err)
+		}
+	}()
+	// Блокируем команду автора для предотвращения гонок данных
+	authorTeam, err := s.lockTeamByUserID(ctx, tx, authorID)
+	if err != nil {
+		return nil, err
+	}
 
 	var exists bool
 	err = tx.QueryRow(ctx, `
@@ -353,6 +481,10 @@ func (s *Store) ReassignReviewer(ctx context.Context, prID, oldUserID string) (*
 			log.Printf("Failed to rollback transaction: %v", err)
 		}
 	}()
+	_, err = s.lockTeamByUserID(ctx, tx, oldUserID)
+	if err != nil {
+		return nil, "", fmt.Errorf("lock team: %w", err)
+	}
 
 	var pr models.PullRequest
 	var mergedAt *time.Time
@@ -509,6 +641,24 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func uniqueStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+
+	for _, v := range values {
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		result = append(result, v)
+	}
+
+	return result
 }
 
 // GetStats возвращает статистику сервиса

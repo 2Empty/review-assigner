@@ -8,6 +8,7 @@ tags:
   - name: Users
   - name: PullRequests
   - name: Health
+  - name: Stats
 
 components:
   parameters:
@@ -26,6 +27,34 @@ components:
         type: string
       description: Идентификатор пользователя
   schemas:
+    DeactivateTeamUsersRequest:
+      type: object
+      required: [team_name]
+      properties:
+        team_name:
+          type: string
+        user_ids:
+          type: array
+          items:
+            type: string
+    Stats:
+      type: object
+      required: [total_prs, prs_by_status, reviews_by_user, active_users, total_teams]
+      properties:
+        total_prs:
+          type: integer
+        prs_by_status:
+          type: object
+          additionalProperties:
+            type: integer
+        reviews_by_user:
+          type: object
+          additionalProperties:
+            type: integer
+        active_users:
+          type: integer
+        total_teams:
+          type: integer
     ErrorResponse:
       type: object
       required: [error]
@@ -122,6 +151,41 @@ components:
           enum: [OPEN, MERGED]
 
 paths:
+  /stats:
+    get:
+      tags: [Stats]
+      summary: Получить статистику сервиса
+      responses:
+        '200':
+          description: Статистика сервиса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stats'
+  /users/deactivateTeamUsers:
+    post:
+      tags: [Users]
+      summary: Массовая деактивация пользователей команды
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeactivateTeamUsersRequest'
+      responses:
+        '200':
+          description: Пользователи деактивированы
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  team_name:
+                    type: string
+                  updated:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/User'
   /team/add:
     post:
       tags: [Teams]
@@ -344,7 +408,7 @@ paths:
                 old_user_id: { type: string }
             example:
               pull_request_id: pr-1001
-              old_reviewer_id: u2
+              old_user_id: u2
       responses:
         '200':
           description: Переназначение выполнено
