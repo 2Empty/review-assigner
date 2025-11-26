@@ -129,15 +129,89 @@ func (s *Store) GetTeam(ctx context.Context, teamName string) (*models.Team, err
 	return team, err
 }
 
-// SetUserActive изменяет флаг активности пользователя
+// lockTeamByUserID блокирует команду пользователя через advisory lock и возвращает имя команды.
+// Возвращает функцию для разблокировки, которую нужно вызвать через defer.
+func (s *Store) lockTeamByUserID(ctx context.Context, userID string) (string, func(), error) {
+	var teamName string
+	err := s.Pool.QueryRow(ctx, `SELECT team_name FROM users WHERE user_id = $1`, userID).Scan(&teamName)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return "", nil, ErrNotFound
+		}
+		return "", nil, fmt.Errorf("get user team: %w", err)
+	}
+
+	_, err = s.Pool.Exec(ctx, "SELECT pg_advisory_lock(hashtext($1))", teamName)
+	if err != nil {
+		return "", nil, fmt.Errorf("lock team: %w", err)
+	}
+
+	unlock := func() {
+		_, _ = s.Pool.Exec(ctx, "SELECT pg_advisory_unlock(hashtext($1))", teamName)
+	}
+
+	return teamName, unlock, nil
+}
+
+// SetUserActive изменяет флаг активности пользователя.
+// При деактивации автоматически переназначает ревьюеров для открытых PR.
 func (s *Store) SetUserActive(ctx context.Context, userID string, isActive bool) (*models.User, error) {
+	// Если активируем пользователя, просто обновляем флаг
+	if isActive {
+		var user models.User
+		err := s.Pool.QueryRow(ctx, `
+			UPDATE users
+			SET is_active = $1
+			WHERE user_id = $2
+			RETURNING user_id, username, team_name, is_active`,
+			isActive, userID).Scan(&user.UserID, &user.Username, &user.TeamName, &user.IsActive)
+
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return nil, fmt.Errorf("set user active: %w", ErrNotFound)
+			}
+			return nil, fmt.Errorf("set user active: %w", err)
+		}
+		return &user, nil
+	}
+
+	// Для деактивации: переназначаем ревьюеров, потом деактивируем
+	// Блокируем команду для предотвращения гонок данных
+	_, unlock, err := s.lockTeamByUserID(ctx, userID)
+	if err != nil {
+		if err == ErrNotFound {
+			return nil, fmt.Errorf("set user active: %w", ErrNotFound)
+		}
+		return nil, err
+	}
+	defer unlock()
+
+	// Пытаемся переназначить ревьюеров для открытых PR
+	prs, err := s.GetUserReviews(ctx, userID)
+	if err != nil {
+		// Если не удалось получить список, всё равно деактивируем пользователя
+		log.Printf("Failed to get user reviews for reassignment: %v", err)
+	} else {
+		// Переназначаем ревьюеров для открытых PR
+		for _, pr := range prs {
+			if pr.Status == "OPEN" {
+				_, _, err := s.ReassignReviewer(ctx, pr.PullRequestID, userID)
+				if err != nil {
+					// Логируем, но продолжаем - не критично если не удалось переназначить
+					log.Printf("Failed to reassign reviewer for PR %s: %v", pr.PullRequestID, err)
+				}
+			}
+		}
+	}
+
+	// Деактивируем пользователя
 	var user models.User
-	err := s.Pool.QueryRow(ctx, `
-	UPDATE users
-	SET is_active = $1
-	WHERE user_id = $2
-	RETURNING user_id, username, team_name, is_active`,
-		isActive, userID).Scan(&user.UserID, &user.Username, &user.TeamName, &user.IsActive)
+	err = s.Pool.QueryRow(ctx, `
+		UPDATE users
+		SET is_active = false
+		WHERE user_id = $1
+		RETURNING user_id, username, team_name, is_active`,
+		userID).Scan(&user.UserID, &user.Username, &user.TeamName, &user.IsActive)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -150,6 +224,13 @@ func (s *Store) SetUserActive(ctx context.Context, userID string, isActive bool)
 
 // CreatePR создает новый PR в базе данных.
 func (s *Store) CreatePR(ctx context.Context, prID, prName, authorID string) (*models.PullRequest, error) {
+	// Блокируем команду автора для предотвращения гонок данных
+	authorTeam, unlock, err := s.lockTeamByUserID(ctx, authorID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -169,19 +250,6 @@ func (s *Store) CreatePR(ctx context.Context, prID, prName, authorID string) (*m
 	}
 	if exists {
 		return nil, ErrPRExists
-	}
-
-	var authorTeam string
-	var authorExists bool
-	err = tx.QueryRow(ctx, `
-        SELECT team_name, true FROM users WHERE user_id = $1`,
-		authorID).Scan(&authorTeam, &authorExists)
-
-	if err == pgx.ErrNoRows {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get author: %w", err)
 	}
 
 	rows, err := tx.Query(ctx, `
@@ -236,10 +304,21 @@ func (s *Store) CreatePR(ctx context.Context, prID, prName, authorID string) (*m
 
 // MergePR помечает PR как мерженный.
 func (s *Store) MergePR(ctx context.Context, prID string) (*models.PullRequest, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil && err != pgx.ErrTxClosed {
+			log.Printf("Failed to rollback transaction: %v", err)
+		}
+	}()
+
 	var pr models.PullRequest
 	var mergedAt *time.Time
 
-	err := s.Pool.QueryRow(ctx, `
+	// Блокируем PR для предотвращения гонок данных
+	err = tx.QueryRow(ctx, `
 		UPDATE pull_requests 
 		SET status = 'MERGED', merged_at = COALESCE(merged_at, CURRENT_TIMESTAMP)
 		WHERE pull_request_id = $1
@@ -255,6 +334,11 @@ func (s *Store) MergePR(ctx context.Context, prID string) (*models.PullRequest, 
 	}
 
 	pr.MergedAt = mergedAt
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
 	return &pr, nil
 }
 
